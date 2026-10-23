@@ -1,0 +1,18 @@
+# File: docker-compose.yml
+# Local dev database only. Apple Silicon: if the image fails to pull,
+# add `platform: linux/amd64` under the db service.
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: khetconnect-db
+    environment:
+      POSTGRES_USER: khet_user
+      POSTGRES_PASSWORD: change_me
+      POSTGRES_DB: khetconnect
+    ports:
+      - "5433:5432"
+    volumes:
+      - khet_pgdata:/var/lib/postgresql/data
+
+volumes:
+  khet_pgdata:
