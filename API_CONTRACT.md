@@ -1,12 +1,12 @@
 <!-- File: API_CONTRACT.md -->
-# KhetConnect API Contract (v0.2)
+# KhetConnect API Contract (v0.3)
 
 Source of truth for backend and Flutter. Live Swagger UI at `http://localhost:8000/docs`
 (generated from the same schemas in `backend/app/schemas/`). If this file and the
 schemas disagree, fix the disagreement before writing more code.
 
-**Implementation status:** Health, Auth and Users (except `GET /users/{id}/ratings`) are implemented (Stage 1).
-Everything else returns `501` until its stage.
+**Implementation status:** Health, Auth, Users (except `GET /users/{id}/ratings`), Resources and Availability are implemented (Stages 1-2).
+Bookings and Ratings return `501` until Stage 3.
 
 ## Conventions
 
@@ -16,8 +16,8 @@ Everything else returns `501` until its stage.
 - IDs are UUID strings. Dates are `YYYY-MM-DD`. Timestamps are ISO 8601 UTC.
 - Money is a JSON **number**, INR per day. Distances are km. Coordinates are WGS84 `lat`, `lng` (decimal degrees).
 - Phone numbers are E.164, India only for now: `+91` followed by 10 digits starting 6-9. Spaces and hyphens in input are stripped before validation.
-- Pagination: `limit` (default 20, max 100) and `offset` (default 0); list responses are `{items, total, limit, offset}`.
-- Errors: `{"detail": "message"}`. Validation errors (422) use FastAPI's default `{"detail": [{loc, msg, type}]}`.
+- Pagination: `limit` (default 20, max 100) and `offset` (default 0); list responses are `{items, total, limit, offset}`. `total` is the number of matches ignoring `limit`/`offset`.
+- Errors: `{"detail": "message"}`. Validation errors (422) use FastAPI's default `{"detail": [{loc, msg, type}]}`; some business-rule 422s (e.g. slot start in the past) use a plain string `detail`.
 - Unknown fields in request bodies are rejected with 422 where noted ("strict" bodies).
 
 | Code | Meaning |
@@ -55,7 +55,7 @@ Everything else returns `501` until its stage.
   "capacity_note": "45 HP", "lat": 17.6, "lng": 78.5, "is_active": true,
   "distance_km": 3.2, "created_at": "2026-10-05T10:00:00Z", "owner": { "...UserPublic" } }
 ```
-`distance_km` is non-null only in search results. Suggested `subtype` values (free text, lower_snake_case; the app should offer these as a dropdown):
+`distance_km` is non-null only in `/resources/discover` results (rounded to 3 decimals). `subtype` is stored normalised: trimmed, lower-case, spaces replaced by `_` (so `"Seed Drill"` becomes `"seed_drill"`). Suggested `subtype` values (the app should offer these as a dropdown):
 - equipment: `tractor`, `rotavator`, `plough`, `seed_drill`, `sprayer`, `harvester`, `thresher`, `water_pump`, `trolley`
 - labor: `sowing`, `weeding`, `harvesting`, `spraying`, `general`
 
@@ -150,6 +150,8 @@ Request (strict body; all fields optional; `lat` and `lng` must be sent together
 - `language_pref` is one of `hi en te ta kn mr bn gu pa ml or`.
 - `phone_number` and other unknown fields are rejected (422): the phone number cannot be changed.
 
+Changing `role` to `farmer` does not delete or deactivate the user's resources, but they are hidden from `/resources/discover` while the role is `farmer` and reappear when the role is `provider` or `both` again.
+
 Response `200`: UserPrivate. Errors: 401; 422.
 
 ### GET /users/{user_id}
@@ -161,45 +163,64 @@ Response `200`: `{ "items": [Rating], "total": 0, "limit": 20, "offset": 0 }` (n
 
 ## Resources
 
+Route order note for implementers: `/resources/discover` and `/resources/mine` are literal paths and are declared before `/resources/{resource_id}`.
+
 ### POST /resources
+Requires role `provider` or `both` and a complete profile (name, district, location).
 Request:
 ```json
 { "type": "equipment", "subtype": "tractor", "description": "Mahindra 575",
   "daily_rate": 1800, "capacity_note": "45 HP", "lat": 17.6, "lng": 78.5 }
 ```
-Response `201`: Resource. Errors: 403 if role is `farmer` or profile incomplete; 422.
+Response `201`: Resource. Errors: 401; 403 if role is `farmer` or profile incomplete; 422.
 
-### GET /resources
-Query: `lat`*, `lng`* (search centre), `radius_km` (default 25, max 200), `type`, `subtype`,
-`max_daily_rate`, `available_from`, `available_to` (only resources with an unbooked slot fully covering the range),
-`limit`, `offset`.
+### GET /resources/discover
+Radius search, nearest first (PostGIS `ST_DWithin` filter + `ST_Distance` sort).
+Query: `lat`*, `lng`* (search centre), `radius_km` (default 25, must be > 0, max 200), `type`, `subtype` (case-insensitive, normalised like stored subtypes),
+`max_daily_rate`, `available_from`, `available_to` (only resources with ONE unbooked slot fully covering the range; if only one of the two is sent, it is used for both ends; `available_to` before `available_from` is a 422),
+`limit` (default 20, max 100), `offset` (default 0).
 Response `200`: `{ "items": [Resource with distance_km], "total": 0, "limit": 20, "offset": 0 }`
-Sorted by distance ascending. Active resources only; the caller's own resources are excluded.
+Rules:
+- Sorted by distance ascending (ties broken by id, so pages are stable).
+- The radius boundary is inclusive: a resource exactly `radius_km` away is returned.
+- Active resources only; the caller's own resources are excluded; resources whose owner currently has role `farmer` are excluded.
+- `total` counts all matches, not just this page.
+
+Errors: 401; 422 (bad coordinates, radius, limit, date order).
 
 ### GET /resources/mine
-Response `200`: `[Resource]` (includes inactive).
+Response `200`: `[Resource]` (includes inactive, newest first, `distance_km` null).
 
 ### GET /resources/{resource_id}
-Response `200`: Resource. Errors: 404.
+Response `200`: Resource. Inactive resources are visible to their owner only. Errors: 401; 404.
 
-### PATCH /resources/{resource_id}
-Request (all optional): `subtype, description, daily_rate, capacity_note, lat+lng, is_active`.
-Response `200`: Resource. Errors: 403 not owner; 404.
+### PATCH /resources/{resource_id}   (also accepted as PUT /resources/{resource_id})
+`PUT` and `PATCH` behave identically (partial update): omitted or `null` fields are unchanged.
+Request (all optional): `subtype, description, daily_rate, capacity_note, lat+lng (together), is_active`.
+Response `200`: Resource. Errors: 401; 403 not owner; 404; 422.
 
 ### DELETE /resources/{resource_id}
-Soft delete (`is_active=false`). Response `204`. Errors: 403; 404; 409 if pending/accepted bookings exist.
+Owner only. Soft delete (`is_active=false`); deleting an already inactive resource is also `204`. Response `204`.
+Errors: 401; 403; 404; 409 if pending/accepted bookings exist.
 
 ## Availability slots
 
-### POST /resources/{resource_id}/slots
+Free date ranges that a provider offers. A slot becomes `is_booked=true` when a booking on it is accepted (Stage 3). Slots of one resource can never overlap.
+
+### POST /resources/{resource_id}/availability
+Owner only.
 Request: `{ "start_date": "2026-10-10", "end_date": "2026-10-12" }`
-Response `201`: Slot. Errors: 403 not owner; 409 overlaps an existing slot; 422 end before start or start in the past.
+Response `201`: Slot.
+Errors: 401; 403 not owner; 404; 409 overlaps an existing slot; 422 end before start, or start in the past (Indian Standard Time date).
 
-### GET /resources/{resource_id}/slots?from_date&to_date&only_available=true
-Response `200`: `[Slot]` ordered by `start_date`.
+### GET /resources/{resource_id}/availability?from_date&to_date&only_available=false
+Any authenticated user (inactive resources: owner only, else 404).
+Returns booked **and** free slots, ordered by `start_date`. `only_available=true` returns free slots only.
+`from_date`/`to_date` keep slots that overlap that window.
+Response `200`: `[Slot]`. Errors: 401; 404.
 
-### DELETE /resources/{resource_id}/slots/{slot_id}
-Response `204`. Errors: 403; 404; 409 if booked or has pending bookings.
+### DELETE /resources/{resource_id}/availability/{slot_id}
+Owner only. Response `204`. Errors: 401; 403; 404; 409 if the slot is booked or has pending/accepted/completed bookings (or booking history that still references it).
 
 ## Bookings
 
@@ -237,6 +258,10 @@ Side effect: recalculates the rated user's `trust_score` and `rating_count`.
 
 ## Changelog
 
+- **v0.3 (Stage 2):** Search moved from `GET /resources` to `GET /resources/discover` (`GET /resources` no longer exists); added `PUT /resources/{id}` as an alias of `PATCH`;
+  slot endpoints renamed from `/slots` to `/availability`; slot list now defaults to `only_available=false` (booked and free); radius boundary is inclusive;
+  `subtype` is normalised on write and on filter; discover hides resources whose owner has role `farmer`; slot start date is checked against the Indian Standard Time date;
+  `DELETE /resources/{id}` is idempotent; `GET /resources/{id}` hides inactive resources from non-owners.
 - **v0.2 (Stage 1):** Added `PUT /users/me` as an alias of `PATCH`; omitted/`null` fields mean "unchanged"; strict body (phone number not editable);
   documented OTP rules (6 digits, 300 s, single use, newest-only, 5 attempts, 30 s cooldown); 401 for a missing token (not 403) with `WWW-Authenticate`;
   added 502 for SMS gateway failure; `role` stays a single enum (`both` covers dual roles); phone input is whitespace/hyphen-tolerant;
